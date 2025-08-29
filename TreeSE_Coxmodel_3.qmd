@@ -1,0 +1,290 @@
+---
+title: "TreeSE_Coxmodel_3"
+format: html
+editor: visual
+---
+
+## This report focuses on evaluating the predictive performance of the Cox proportional hazards model under transformed and un-transformed data. The primary objective is to identify which transformation method allows the Cox model to yield the most accurate survival predictions. By systematically applying distinct transformations to the data-set and assessing the model’s performance, this study aims to provide insights into optimizing data pre-processing for survival analysis.
+
+Load libraries
+
+```{r, message=FALSE, warning=FALSE, echo=TRUE}
+library(mia)
+library(ggplot2)
+library(lattice)
+library(TreeSummarizedExperiment)
+library(coda4microbiome)
+library(SummarizedExperiment)
+library(tibble)
+library(phyloseq)
+library(survival)
+library(survival)
+```
+
+link to download the biom.Rdata dataset: https://github.com/wg99526/MiSurvGit/tree/main/Data
+
+```{r}
+load("~/Desktop/thesis work/draft_experiments/Microbiome_Analysis/TreeSE_survival_analysis/biom.Rdata")
+```
+
+convert phyloseq object to TreeSE
+
+```{r, message=FALSE, warning=FALSE, echo=TRUE}
+tse <- convertFromPhyloseq(biom)
+```
+
+```{r}
+library(mia)
+
+# 1. Agglomerate features at Genus level
+tse_genus <- agglomerateByRank(tse, rank = "Genus")
+
+# Check structure
+tse_genus
+
+# 2. Filter out taxa that are zero in more than 95% of samples
+# Calculate prevalence for each feature
+prev <- apply(assay(tse_genus), 1, function(x) sum(x > 0) / length(x))
+
+# Keep taxa present in at least 5% of samples
+keep <- prev >= 0.05
+tse_filtered <- tse_genus[keep, ]
+
+# Check structure after filtering
+tse_filtered
+
+```
+
+prepare transformed assay
+
+```{r}
+#all pair-wise log ratio format
+coef_threshold = 0
+lambda = "lambda.1se" 
+nvar = NULL
+alpha = 0.9
+nfolds = 5
+showPlots = TRUE
+x1 <- impute_zeros(assay(tse_filtered))
+x1 <- t(x1)
+kselect <- ncol(x1)
+taxaselect <- (1:ncol(x1))
+lrmatrix <- logratios_matrix(x1)
+x_lrX <- lrmatrix[[1]] #all pair-wise log ratio transformed assay
+x_lrX <- t(x_lrX)
+idlrX <- lrmatrix[[2]]
+```
+
+Prepare the TreeSummarizedExperiment that contain several assays
+
+```{r, message=FALSE, warning=FALSE, echo=TRUE}
+tse_filtered <- transformAssay(tse_filtered, method = 'relabundance')
+tse_filtered <- transformAssay(tse_filtered, method = 'clr', pseudocount = T)
+```
+
+Add alternative experiment to the TreeSE
+
+```{r}
+library(SummarizedExperiment)
+se <- SummarizedExperiment(assays = list(counts = x_lrX))
+altExp(tse_filtered, "all pair-wise log ratio") <- se
+altExpNames(tse_filtered)
+```
+
+split data
+
+```{r}
+set.seed(123)
+
+# Get number of samples
+num_samples <- ncol(tse_filtered)
+
+# Split into training and test indices
+train_indices <- sample(seq_len(num_samples), size = floor(0.7 * num_samples))
+test_indices <- setdiff(seq_len(num_samples), train_indices)
+
+# Subset the TreeSummarizedExperiment object
+tse_train <- tse_filtered[, train_indices]
+tse_test  <- tse_filtered[, test_indices]
+```
+
+prepare training data
+
+```{r}
+col_data_train <- as.data.frame(colData(tse_train))
+# Convert all assays to matrices
+x_counts_train       <- t(as.matrix(assay(tse_train, "counts")))
+x_clr_train          <- t(as.matrix(assay(tse_train, "clr")))
+x_relabundance_train <- t(as.matrix(assay(tse_train, "relabundance")))
+x_aplr_train         <- t(as.matrix(assay(altExp(tse_train, "all pair-wise log ratio")))) 
+# Combine all assays and alternativeexperiemnt
+x_full_train <- cbind(x_counts_train, x_clr_train, x_relabundance_train, x_aplr_train)
+# Replace row names with only digits extracted from original row names
+rownames(x_full_train) <- gsub("\\D", "", rownames(x_full_train))
+colnames(x_full_train) <- gsub("\\D", "", colnames(x_full_train))
+time_train <- col_data_train$T1Dweek   # numeric vector
+status_train <- col_data_train$T1D  # binary vector (0 = censored, 1 = event)
+covars_train <- col_data_train[, c("Antibiotics", "Sex")]
+```
+
+prepare testing data
+
+```{r}
+#prepare the testing subset
+col_data_test <- as.data.frame(colData(tse_test))
+# Extract time-to-event and status from colData
+time_test <- col_data_test$T1Dweek   # numeric vector
+status_test <- col_data_test$T1D  # binary vector (0 = censored, 1 = event)
+covars_test <- col_data_test[, c("Antibiotics", "Sex")]  # update with correct column names
+# Extract abundance matrix (assumes 1st assay)
+# Convert all assays to matrices
+x_counts_test       <- t(as.matrix(assay(tse_test, "counts")))
+x_clr_test          <- t(as.matrix(assay(tse_test, "clr")))
+x_relabundance_test <- t(as.matrix(assay(tse_test, "relabundance")))
+x_aplr_test         <- t(as.matrix(assay(altExp(tse_test, "all pair-wise log ratio"))))
+# Combine all assays and alternativeexperiemnt
+x_full_test <- cbind(x_counts_test, x_clr_test, x_relabundance_test, x_aplr_test)
+# Replace row names with only digits extracted from original row names
+rownames(x_full_test) <- gsub("\\D", "", rownames(x_full_test))
+colnames(x_full_test) <- gsub("\\D", "", colnames(x_full_test))
+```
+
+store the assays
+
+```{r}
+# Assay list from your TreeSummarizedExperiment (TSE)
+#1-assays from the training subset of tse object
+assay_list_train <- list(
+  Counts = x_counts_train,
+  CLR = x_clr_train,
+  RelativeAbundance = x_relabundance_train,
+  APLR = x_aplr_train
+)
+#2-assays from the testing subset of tse object
+assay_list_test <- list(
+  Counts = x_counts_test,
+  CLR = x_clr_test,
+  RelativeAbundance = x_relabundance_test,
+  APLR = x_aplr_test
+)
+```
+
+```{r}
+set.seed(123)
+y_test = Surv(time_test, status_test)# Cox response variable (time & status)
+y = Surv(time_train, status_train)# fits a standard Cox proportional hazards model (coxph) using all covariate
+df1 <- data.frame(as.matrix(y), covars_train)
+model1 <- coxph(Surv(time_train, status_train) ~ ., data = df1)
+x1 <- predict(model1)#linear predictor
+```
+
+implement cox model by looping over all assays/altExps
+
+```{r}
+# 1. Create empty list to store models
+cvfit_list <- list()
+
+# 2. First loop: Fit a separate model for each assay
+for (assay_name in names(assay_list_train)) {
+  x_assay_train <- assay_list_train[[assay_name]]
+  
+  cvfit <- glmnet::cv.glmnet(x_assay_train, y,
+                             family = "cox",
+                             type.measure = "C",
+                             nfolds = 5,
+                             alpha = alpha,
+                             keep = TRUE,
+                             offset = x1)
+  
+  # Store the trained model
+  cvfit_list[[assay_name]] <- cvfit
+}
+```
+
+```{r}
+# 3. Create a named vector to store C-indices
+cindex_results <- numeric(length(assay_list_test))
+names(cindex_results) <- names(assay_list_test)
+
+# 4. Second loop: Predict on test set and compute C-index
+for (assay_name in names(assay_list_test)) {
+  x_assay_test <- assay_list_test[[assay_name]]
+  cvfit <- cvfit_list[[assay_name]]  # retrieve matching model
+  lambda_best <- cvfit$lambda.min    # or use a fixed lambda if you want
+  
+  # Predict on test set
+  predictions <- as.numeric(predict(cvfit, newx = x_assay_test, s = lambda_best, newoffset = x1))
+  
+  # Compute and store C-index
+  cindex_results[assay_name] <- glmnet::Cindex(pred = predictions, y_test)
+}
+
+```
+
+```{r}
+print(cindex_results)
+```
+
+```{r}
+# Number of folds used in cross-validation
+nfolds <- 5
+
+# Initialize matrix to store C-indices: rows = assays, cols = folds
+cindex_matrix <- matrix(NA, nrow = length(cvfit_list), ncol = nfolds)
+rownames(cindex_matrix) <- names(cvfit_list)
+colnames(cindex_matrix) <- paste0("Fold", 1:nfolds)
+
+# Compute C-index per fold per assay
+for (assay_name in names(cvfit_list)) {
+  cvfit <- cvfit_list[[assay_name]]
+  
+  # Get per-fold predictions from the cross-validation
+  fit_preval <- cvfit$fit.preval  # matrix of predictions: rows = samples, cols = lambdas
+  foldid <- cvfit$foldid          # which fold each sample was in
+  lambda_index <- which(cvfit$lambda == cvfit$lambda.min)
+  
+  for (k in 1:nfolds) {
+    test_indices <- which(foldid == k)
+    preds <- fit_preval[test_indices, lambda_index]
+    y_fold <- y[test_indices]
+    
+    # Compute C-index for that fold and assay
+    cindex_matrix[assay_name, k] <- glmnet::Cindex(pred = preds, y_fold)
+  }
+}
+
+# View the C-index matrix
+print(cindex_matrix)
+
+```
+
+```{r}
+library(reshape2)  # for melting the matrix
+library(ggplot2)
+
+# Convert matrix to long format dataframe
+df_cindex <- melt(cindex_matrix, varnames = c("Assay", "Fold"), value.name = "Cindex")
+
+# Plot boxplot
+ggplot(df_cindex, aes(x = Assay, y = Cindex)) +
+  geom_boxplot(fill = "skyblue", color = "darkblue") +
+  theme_minimal() +
+  labs(title = "C-index Distribution Across Assays",
+       x = "Assay Version",
+       y = "C-index") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+Test the difference between the C-indices
+
+```{r}
+kruskal_test_result <- kruskal.test(Cindex ~ Assay, data = df_cindex)
+print(kruskal_test_result)
+```
+
+```{r}
+friedman_result <- friedman.test(as.matrix(cindex_matrix))
+# Print the result
+print(friedman_result)
+```
